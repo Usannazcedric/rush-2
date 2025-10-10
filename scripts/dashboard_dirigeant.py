@@ -4,49 +4,94 @@ import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 
-# --------- Helpers ---------
-def load_monthly(excel_path: Path, sheet_name: str = "monthly") -> pd.DataFrame:
-    df = pd.read_excel(excel_path, sheet_name=sheet_name)
-    expected = {"timestamp", "category", "qty"}
-    missing = expected - set(df.columns)
-    if missing:
-        raise ValueError(f"Colonnes manquantes dans {sheet_name}: {missing}. Colonnes présentes: {df.columns.tolist()}")
-    df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
+
+TS_CANDIDATES = ["timestamp", "datetime", "date", "datum"]
+CAT_CANDIDATES = ["category", "categorie", "code_atc", "atc", "famille", "family"]
+QTY_CANDIDATES = ["qty", "quantite", "quantity", "qte", "qtty", "quantité"]
+
+def _find_col(df: pd.DataFrame, candidates: list[str]) -> str:
+    cols = {c.lower(): c for c in df.columns}
+    for cand in candidates:
+        if cand.lower() in cols:
+            return cols[cand.lower()]
+    raise ValueError(
+        f"Impossible de trouver une colonne parmi {candidates}. "
+        f"Colonnes disponibles: {df.columns.tolist()}"
+    )
+
+def _read_any(input_path: Path, sheet_name: str | None) -> pd.DataFrame:
+    suffix = input_path.suffix.lower()
+    if suffix in {".csv", ".txt"}:
+        try:
+            return pd.read_csv(input_path)
+        except UnicodeDecodeError:
+            return pd.read_csv(input_path, encoding="latin-1", sep=";")
+    else:
+  
+        return pd.read_excel(input_path, sheet_name=sheet_name or 0)
+
+def load_jan_sep(input_path: Path, sheet_name: str | None = None) -> pd.DataFrame:
+    """
+    Charge le fichier (CSV ou Excel), détecte les colonnes datetime/category/qty,
+    nettoie, et filtre JAN→SEP (mois 1..9) pour TOUTES les années.
+    """
+    df = _read_any(input_path, sheet_name)
+
+    ts_col = _find_col(df, TS_CANDIDATES)
+    cat_col = _find_col(df, CAT_CANDIDATES)
+    qty_col = _find_col(df, QTY_CANDIDATES)
+
+    df = df.rename(columns={ts_col: "timestamp", cat_col: "category", qty_col: "qty"})
+    df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce", utc=False)
+    df["qty"] = pd.to_numeric(df["qty"], errors="coerce")
+
     df = df.dropna(subset=["timestamp", "qty"])
     df["year"] = df["timestamp"].dt.year
     df["month"] = df["timestamp"].dt.month
 
-    # ✅ IMPORTANT : ne garder que JAN → SEP (1..9) pour toutes les années
     df = df[df["month"].between(1, 9)]
 
-    return df
+    df["category"] = df["category"].astype(str)
+
+    return df[["timestamp", "year", "month", "category", "qty"]].copy()
 
 def apply_price_map(df: pd.DataFrame, price_map_path: Path | None) -> pd.DataFrame:
     """
-    Si price_map fourni (colonnes: category, price), calcule 'amount' = qty * price
-    Sinon, crée 'amount' = qty comme proxy de CA.
+    Si price_map fourni (colonnes: category, price), calcule 'amount' = qty * price.
+    Sinon, 'amount' = qty (proxy de CA).
     """
     df = df.copy()
     if price_map_path is None:
         df["amount"] = df["qty"].astype(float)
         return df
 
-    prices = pd.read_csv(price_map_path)
+    prices = _read_any(price_map_path, None)
+    if "category" not in prices.columns:
+        for alt in ["Code_ATC", "code_atc", "categorie", "Category"]:
+            if alt in prices.columns:
+                prices = prices.rename(columns={alt: "category"})
+                break
+
     req_cols = {"category", "price"}
     if not req_cols.issubset(prices.columns):
-        raise ValueError(f"Le fichier prix doit contenir les colonnes {req_cols}. Colonnes présentes: {prices.columns.tolist()}")
+        raise ValueError(
+            f"Le fichier prix doit contenir les colonnes {req_cols}. "
+            f"Colonnes présentes: {prices.columns.tolist()}"
+        )
+
     prices["category"] = prices["category"].astype(str)
     df["category"] = df["category"].astype(str)
+
     merged = df.merge(prices[["category", "price"]], on="category", how="left")
     if merged["price"].isna().any():
         missing_cats = merged.loc[merged["price"].isna(), "category"].unique()[:20]
         print(f"[AVERTISSEMENT] Prix manquants pour certaines catégories (extrait): {missing_cats}")
         merged["price"] = merged["price"].fillna(0.0)
+
     merged["amount"] = merged["qty"].astype(float) * merged["price"].astype(float)
     return merged
 
 def compute_annual_kpis(df: pd.DataFrame) -> pd.DataFrame:
-    # KPIs calculés uniquement sur la fenêtre jan→sep
     kpi = (
         df.groupby("year")
           .agg(CA=("amount", "sum"),
@@ -55,7 +100,6 @@ def compute_annual_kpis(df: pd.DataFrame) -> pd.DataFrame:
           .sort_values("year")
     )
     kpi["Growth_%"] = kpi["CA"].pct_change() * 100
-    # Panier moyen proxy (si pas de nb de commandes)
     kpi["Avg_Basket_proxy"] = kpi["CA"] / kpi["Volume"].replace(0, np.nan)
     return kpi
 
@@ -75,7 +119,7 @@ def plot_pie_category_amount(df: pd.DataFrame, outpath: Path) -> Path:
     pie_data = df.groupby("category")["amount"].sum().sort_values(ascending=False)
     plt.figure(figsize=(7,7))
     pie_data.plot.pie(autopct="%1.1f%%", startangle=90)
-    plt.title("Répartition du CA (jan–sep) par grande famille thérapeutique")
+    plt.title("Répartition des ventes (jan–sep) par grande famille thérapeutique")
     plt.ylabel("")
     plt.tight_layout()
     plt.savefig(outpath, dpi=150, bbox_inches="tight")
@@ -85,16 +129,15 @@ def plot_pie_category_amount(df: pd.DataFrame, outpath: Path) -> Path:
 def plot_annual_trend(kpi: pd.DataFrame, outpath: Path) -> Path:
     plt.figure(figsize=(8,5))
     plt.plot(kpi["year"], kpi["CA"], marker="o", linewidth=2)
-    # Annoter les points
     for x, y in zip(kpi["year"], kpi["CA"]):
         try:
             label = f"{int(round(y)):,}".replace(",", " ")
-        except:
+        except Exception:
             label = f"{y:.0f}"
         plt.text(x, y, label, va="bottom", ha="center", fontsize=9)
-    plt.title("Évolution du chiffre d'affaires (jan–sep) par année")
+    plt.title("Évolution des Ventes mensuelles (jan–sep) par année")
     plt.xlabel("Année")
-    plt.ylabel("Chiffre d'affaires (jan–sep)")
+    plt.ylabel("Ventes (jan–sep)")
     plt.grid(True)
     plt.tight_layout()
     plt.savefig(outpath, dpi=150, bbox_inches="tight")
@@ -102,7 +145,6 @@ def plot_annual_trend(kpi: pd.DataFrame, outpath: Path) -> Path:
     return outpath
 
 def compute_seasonality(df: pd.DataFrame) -> pd.DataFrame:
-    # Seasonality calculée sur jan→sep uniquement (aligné avec la fenêtre)
     season = df.groupby(["category", "month"])["qty"].sum().reset_index()
     season["cat_mean"] = season.groupby("category")["qty"].transform("mean")
     season["season_index"] = (season["qty"] / season["cat_mean"].replace(0, np.nan)) * 100
@@ -110,39 +152,34 @@ def compute_seasonality(df: pd.DataFrame) -> pd.DataFrame:
 
 def generate_recommendations(kpi: pd.DataFrame, season: pd.DataFrame, df: pd.DataFrame, top_decliners_n: int = 3) -> list[str]:
     recos = []
-    # Croissance globale (jan→sep)
     if len(kpi) >= 2 and pd.notna(kpi["Growth_%"].iloc[-1]):
         g = kpi["Growth_%"].iloc[-1]
         y = int(kpi["year"].iloc[-1])
         if g > 5:
-            recos.append(f"Le CA (jan–sep) progresse de {g:.1f}% sur {y} : renforcer la capacité logistique et anticiper les stocks.")
+            recos.append(f"Le CA (jan–sep) progresse de {g:.1f}% en {y} : renforcer la capacité logistique et anticiper les stocks.")
         elif g < -5:
-            recos.append(f"Le CA (jan–sep) recule de {g:.1f}% sur {y} : analyser le mix catégories et activer des campagnes ciblées.")
+            recos.append(f"Le CA (jan–sep) recule de {g:.1f}% en {y} : analyser le mix catégories et activer des campagnes ciblées.")
         else:
-            recos.append(f"CA (jan–sep) global stable sur {y} : maintenir la stratégie et optimiser les coûts.")
+            recos.append(f"CA (jan–sep) global stable en {y} : maintenir la stratégie et optimiser les coûts.")
 
-    # NB: comme on coupe à sep, l'analyse « pics hivernaux » est partielle (décembre exclu).
-    # On garde néanmoins des indices sur jan/fév si présents.
-    winter = season[season["month"].isin([1,2])]  # 12 n'est pas présent dans la fenêtre
+    winter = season[season["month"].isin([1, 2])]
     winter_peaks = (winter.sort_values(["category", "season_index"], ascending=[True, False])
-                          .groupby("category")
-                          .head(1))
+                         .groupby("category")
+                         .head(1))
     respiratory_like = [c for c in winter_peaks["category"].unique()
                         if any(k in str(c).lower() for k in ["gripp", "resp", "rhume", "toux"])]
     if respiratory_like:
-        recos.append("Renforcer les effectifs en hiver (jan–fév) pour gérer le pic respiratoire détecté sur la fenêtre jan–sep.")
+        recos.append("Renforcer les effectifs en hiver (jan–fév) pour gérer le pic respiratoire détecté (jan–sep).")
 
-    # Pics printaniers (mar–mai) : conservé tel quel
-    spring = season[season["month"].isin([3,4,5])]
+    spring = season[season["month"].isin([3, 4, 5])]
     spring_peaks = (spring.sort_values(["category", "season_index"], ascending=[True, False])
-                          .groupby("category")
-                          .head(1))
+                         .groupby("category")
+                         .head(1))
     pain_like = [c for c in spring_peaks["category"].unique()
                  if any(k in str(c).lower() for k in ["alg", "anti-inflamm", "douleur", "ibup", "aspir", "parac"])]
     if pain_like:
         recos.append("Optimiser le stock des antalgiques au printemps (mar–mai).")
 
-    # Catégories en recul entre les 2 dernières années (jan–sep only)
     cat_year = df.groupby([df["timestamp"].dt.year, "category"])["qty"].sum().reset_index()
     cat_year.columns = ["year", "category", "qty"]
     if cat_year["year"].nunique() >= 2:
@@ -156,28 +193,30 @@ def generate_recommendations(kpi: pd.DataFrame, season: pd.DataFrame, df: pd.Dat
             recos.append(f"Prioriser des actions sur les catégories en baisse (jan–sep) : {', '.join(declining.index.tolist())}.")
     return recos
 
-# --------- Main ---------
+
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--excel", required=True, type=Path, help="Chemin du fichier Excel source")
-    ap.add_argument("--sheet", default="monthly", help="Nom de la feuille à lire (par défaut: monthly)")
+    ap.add_argument("--input", required=True, type=Path,
+                    help="Chemin du CSV/XLSX source (ex: Bonexcel.xlsx ou export.csv)")
+    ap.add_argument("--sheet", default=None,
+                    help="Nom/Index de feuille si Excel (par défaut: 1ère feuille)")
     ap.add_argument("--outdir", default="out", help="Dossier de sortie")
-    ap.add_argument("--price-map", type=Path, default=None, help="CSV prix par catégorie (colonnes: category, price)")
+    ap.add_argument("--price-map", type=Path, default=None,
+                    help="CSV/XLSX des prix (colonnes: category, price). Optionnel.")
     args = ap.parse_args()
 
     outdir = Path(args.outdir)
     outdir.mkdir(parents=True, exist_ok=True)
 
-    # 1) Load & pricing (jan→sep déjà filtré)
-    df = load_monthly(args.excel, sheet_name=args.sheet)
+    df = load_jan_sep(args.input, sheet_name=args.sheet)
     df = apply_price_map(df, args.price_map)
 
-    # 2) KPIs (jan→sep)
+
     kpi = compute_annual_kpis(df)
     kpi_path = outdir / "kpis_annuels_jan_sep.csv"
     kpi.to_csv(kpi_path, index=False, encoding="utf-8-sig")
 
-    # 3) Shares & Top (jan→sep)
+
     shares = compute_category_shares(df)
     shares_path = outdir / "parts_de_marche_par_categorie_jan_sep.csv"
     shares.to_csv(shares_path, index=False, encoding="utf-8-sig")
@@ -186,14 +225,13 @@ def main():
     top3_path = outdir / "top3_categories_jan_sep.csv"
     top3.to_csv(top3_path, index=False, encoding="utf-8-sig")
 
-    # 4) Charts (jan→sep)
     pie_path = outdir / "pie_ca_par_famille_jan_sep.png"
     plot_pie_category_amount(df, pie_path)
 
     trend_path = outdir / "ca_trend_annuel_jan_sep.png"
     plot_annual_trend(kpi, trend_path)
 
-    # 5) Seasonality + recommendations (jan→sep)
+
     season = compute_seasonality(df)
     recos = generate_recommendations(kpi, season, df)
     reco_path = outdir / "recommandations_strategiques_jan_sep.txt"
